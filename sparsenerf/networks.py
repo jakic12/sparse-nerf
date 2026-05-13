@@ -156,7 +156,7 @@ def initialize_weights(m):
         nn.init.constant_(m.bias, 0)
 
 class UNet(nn.Module):
-    def __init__(self, in_channels, out_channels = 4, depth=3, first_channels=16, use_skip=True):
+    def __init__(self, in_channels, out_channels = 4, depth=3, first_channels=16, use_skip=True, downsample_size=256):
         super(UNet, self).__init__()
 
         self.double_conv_left= nn.ModuleList()
@@ -166,6 +166,7 @@ class UNet(nn.Module):
         self.depth = depth
         self.use_skip = use_skip
         self.out_channels = out_channels
+        self.downsample_size = downsample_size
 
         self.relu = nn.ReLU()
 
@@ -202,7 +203,7 @@ class UNet(nn.Module):
     def forward(self, x : Tensor):
         x = F.interpolate(
             x,
-            size=(512, 512),
+            size=(self.downsample_size, self.downsample_size),
             mode='bilinear',   # common for images
             align_corners=False
         )

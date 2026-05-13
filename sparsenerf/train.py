@@ -46,7 +46,7 @@ class SparseNeRFScene:
         opt_nerf = torch.optim.Adam(self.nerf_model.parameters(), lr=learning_rate)
         opt_focal = torch.optim.Adam(self.focal_net.parameters(), lr=learning_rate)
         opt_pose = torch.optim.Adam(self.pose_param_net.parameters(), lr=learning_rate)
-        self.opt_enc = torch.optim.Adam(self.im_encoder_net.parameters(), lr=learning_rate)
+        self.opt_enc = torch.optim.Adam(self.im_encoder_net.parameters(), lr=learning_rate/10)
         self.optimisers = [opt_nerf, opt_focal, opt_pose]
 
         from torch.optim.lr_scheduler import MultiStepLR
@@ -79,17 +79,6 @@ class SparseNeRFScene:
             self.learned_c2ws = torch.stack(c2ws)
             self.learned_c2ws_inv = torch.stack([inv_c2w(c2w) for c2w in c2ws])
 
-            if use_im_encoder:
-                inputs = self.train_imgs.permute(0, 3, 1, 2).to('cuda')
-                self.encoded_ims = self.im_encoder_net(inputs).permute(0, 2, 3, 1)
-            else:
-                self.encoded_ims = self.train_imgs.to('cuda') # (N, H, W, C)
-
-            self.im_features_downsampling_ratio = torch.tensor([
-                self.train_imgs.shape[1]/self.encoded_ims.shape[1],
-                self.train_imgs.shape[2]/self.encoded_ims.shape[2]
-            ], device=self.encoded_ims.device)
-
     def get_pose_history(self):
         return torch.stack(self.pose_history).detach().cpu().numpy()  # (N_epoch, N_img, 3)
     
@@ -97,6 +86,9 @@ class SparseNeRFScene:
         # rotation + translation
         R = self.learned_c2ws_inv[:, :3, :3] # (N_cam, 3, 3)
         t = self.learned_c2ws_inv[:, :3, 3]  # (N_cam, 3)
+
+        H_rays, W_rays, N_samples, _ = sample_pos.shape
+        N_cam = R.shape[0]
 
         # expand points for broadcasting
         pts = sample_pos.unsqueeze(0)                    # (1, 32, 32, N_sample, 3)
@@ -107,32 +99,38 @@ class SparseNeRFScene:
             R,
             pts.expand(R.shape[0], -1, -1, -1, -1)
         ) + t[:, None, None, None, :] # (N_cam, W, H, N_sample, 3)
+        pts_cam = pts_cam.detach()
 
         uv, _ = pts_cam_to_img(pts_cam, fxfy[0], fxfy[1], H, W) # (N_cam, 32, 32, N_sample, C)
-        uv /= self.im_features_downsampling_ratio
-        uv = uv.int()
 
         # pixel coordinates
         u = uv[..., 0]   # (N_cam, 32, 32, N_sample)
         v = uv[..., 1]   # (N_cam, 32, 32, N_sample)
 
-        # clamp to valid image bounds
-        u = u.clamp(0, self.encoded_ims.shape[1] - 1)
-        v = v.clamp(0, self.encoded_ims.shape[2] - 1)
+        grid_y = 2.0 * (u / (H - 1)) - 1.0
+        grid_x = 2.0 * (v / (W - 1)) - 1.0
 
-        # camera indices
-        cam_idx = torch.arange(self.encoded_ims.shape[0], device=uv.device).view(-1, 1, 1, 1)
+        grid = torch.stack([grid_x, grid_y], dim=-1) # (N_cam, H_rays, W_rays, N_samples, 2)
+        grid = grid.reshape(N_cam, H_rays, W_rays * N_samples, 2)
 
-        # sample image values/features
-        sampled1 = self.encoded_ims[cam_idx, u, v].permute(2, 1, 3, 0, 4) # (H, W, N_sample, N_cam, C)
+        sampled = F.grid_sample(
+            self.encoded_ims.permute(0, 3, 1, 2),
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=True,
+        ) # (N_cam, C, H_rays, W_rays * N_samples)
 
-        # mask the current image
+        sampled = sampled.reshape(N_cam, sampled.shape[1], H_rays, W_rays, N_samples)
+        sampled = sampled.permute(2, 3, 4, 0, 1)  # (H_rays, W_rays, N_samples, N_cam, C)
+
+        sampled = self.encoded_ims[0,0,0].repeat(H_rays, W_rays, N_samples, N_cam, 1)
+
         if current_image is not None:
-            sampled1[:, :, :, current_image, :] = 0
+            sampled[:, :, :, current_image, :] = 0.0
 
-        _H, _W, _N, _ = sample_pos.shape
-        sampled2 = sampled1.reshape(_H, _W, _N, -1) # (H, W, N_sample, C * N_cam)
-        return sampled2
+        return sampled.reshape(H_rays, W_rays, N_samples, -1)  # (H_rays, W_rays, N_samples, N_cam * C)
+
 
     def _model_render_image(self, H, W, c2w, rays_cam, t_vals, fxfy, perturb_t, sigma_noise_std, image_i=None):
         """
@@ -191,6 +189,17 @@ class SparseNeRFScene:
         np.random.shuffle(ids)
 
         for i in ids:
+            if self.use_im_encoder:
+                inputs = self.train_imgs.permute(0, 3, 1, 2).to('cuda')
+                self.encoded_ims = self.im_encoder_net(inputs).permute(0, 2, 3, 1)
+            else:
+                self.encoded_ims = self.train_imgs.to('cuda') # (N, H, W, C)
+
+            self.im_features_downsampling_ratio = torch.tensor([
+                self.train_imgs.shape[1]/self.encoded_ims.shape[1],
+                self.train_imgs.shape[2]/self.encoded_ims.shape[2]
+            ], device=self.encoded_ims.device)
+
             fxfy = self.focal_net()
 
             # KEY 1: compute ray directions using estimated intrinsics online.
@@ -211,17 +220,16 @@ class SparseNeRFScene:
 
             # If we are training the im encoder, we have to keep the graph between runs.
             # On the last run we can free it
-            L2_loss.backward(retain_graph=self.train_im_encoder and i != len(ids-1))
-            print('L2_loss.backward()')
+            L2_loss.backward()
 
             for opt in self.optimisers: opt.step()
             for opt in self.optimisers: opt.zero_grad()
+            if self.train_im_encoder:
+                self.opt_enc.step()
+                self.opt_enc.zero_grad()
 
             L2_loss_epoch.append(L2_loss)
         
-        if self.train_im_encoder:
-            self.opt_enc.step()
-            self.opt_enc.zero_grad()
 
         L2_loss_epoch_mean = torch.stack(L2_loss_epoch).mean().item()
         return L2_loss_epoch_mean
