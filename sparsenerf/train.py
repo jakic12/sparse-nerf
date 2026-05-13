@@ -6,6 +6,7 @@ import torch
 
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import MultiStepLR
 from tqdm import tqdm
 
 from sparsenerf.networks import LearnFocal, LearnPose, TinyNerf, UNet, inv_c2w
@@ -17,23 +18,48 @@ from sparsenerf.nerfmm.utils.pos_enc import encode_position
 from sparsenerf.nerfmm.utils.training_utils import mse2psnr
 
 class SparseNeRFScene:
-    def __init__(self, im_encoder_net, im_encoder_out_features, N_EPOCH, H, W, EVAL_INTERVAL, ray_params, train_imgs, scene_name, RUN_NAME, learning_rate = 0.001, use_im_encoder=False, use_views=False, train_im_encoder=False):
+    def __init__(self,
+        im_encoder_net,
+        im_encoder_out_features,
+        N_EPOCH,
+        EVAL_INTERVAL,
+        ray_params,
+        train_imgs,
+        scene_name=None,
+        RUN_NAME=None,
+        learning_rate = 0.001,
+        use_im_encoder=False,
+        use_views=False,
+        train_im_encoder=False,
+        n_views=-1,
+        mask_current_view=True,
+        disable_writer=False,
+        device='cuda'
+    ):
+        self.device = device
+
+        self.H = train_imgs.shape[1]
+        self.W = train_imgs.shape[2]
+
         # Initialise all trainabled parameters
-        self.focal_net = LearnFocal(H, W, req_grad=True).cuda()
-        self.pose_param_net = LearnPose(num_cams=train_imgs.shape[0], learn_R=True, learn_t=True).cuda()
+        self.focal_net = LearnFocal(self.H, self.W, req_grad=True).to(self.device)
+        self.pose_param_net = LearnPose(num_cams=train_imgs.shape[0], learn_R=True, learn_t=True).to(self.device)
+
+        if n_views == -1:
+            self.n_views = train_imgs.shape[0]
+        else:
+            self.n_views = n_views
 
         img_features = None
         if use_views:
-            img_features = 3 * train_imgs.shape[0]
+            img_features = 3 * self.n_views
             if use_im_encoder:
-                img_features = im_encoder_out_features * train_imgs.shape[0]
+                img_features = im_encoder_out_features * self.n_views
 
         # Get a tiny NeRF model. Hidden dimension set to 128
-        self.nerf_model = TinyNerf(pos_in_dims=63, dir_in_dims=27, D=128, image_feat_dim=img_features).cuda()
+        self.nerf_model = TinyNerf(pos_in_dims=63, dir_in_dims=27, D=128, image_feat_dim=img_features).to(self.device)
 
         self.im_encoder_net = im_encoder_net
-        self.H = H
-        self.W = W
         self.N_EPOCH = N_EPOCH
         self.EVAL_INTERVAL = EVAL_INTERVAL
         self.ray_params = ray_params
@@ -43,6 +69,7 @@ class SparseNeRFScene:
         self.use_im_encoder = use_im_encoder
         self.use_views = use_views
         self.train_im_encoder = train_im_encoder
+        self.mask_current_view = mask_current_view
 
         # Set lr and scheduler: these are just stair-case exponantial decay lr schedulers.
         opt_nerf = torch.optim.Adam(self.nerf_model.parameters(), lr=learning_rate)
@@ -51,46 +78,47 @@ class SparseNeRFScene:
         self.opt_enc = torch.optim.Adam(self.im_encoder_net.parameters(), lr=learning_rate/10)
         self.optimisers = [opt_nerf, opt_focal, opt_pose]
 
-        from torch.optim.lr_scheduler import MultiStepLR
-        scheduler_nerf = MultiStepLR(opt_nerf, milestones=list(range(0, 10000*10, 10)), gamma=0.9954)
-        scheduler_focal = MultiStepLR(opt_focal, milestones=list(range(0, 10000*10, 100)), gamma=0.9)
-        scheduler_pose = MultiStepLR(opt_pose, milestones=list(range(0, 10000*10, 100)), gamma=0.9)
-        scheduler_enc = MultiStepLR(self.opt_enc, milestones=list(range(0, 10000, 100)), gamma=0.9)
+        scheduler_nerf = MultiStepLR(opt_nerf, milestones=list(range(0, 10000*10, 10*10)), gamma=0.9954)
+        scheduler_focal = MultiStepLR(opt_focal, milestones=list(range(0, 10000*10, 100*10)), gamma=0.9)
+        scheduler_pose = MultiStepLR(opt_pose, milestones=list(range(0, 10000*10, 100*10)), gamma=0.9)
+        scheduler_enc = MultiStepLR(self.opt_enc, milestones=list(range(0, 10000, 100*10)), gamma=0.9)
         self.schedulers = [scheduler_nerf, scheduler_focal, scheduler_pose]
         if train_im_encoder:
             self.schedulers.append(scheduler_enc)
 
         # training stuff
-        self.pose_history = []
         self.epoch = 0
         # Set tensorboard writer
-        log_path = os.path.join('logs', self.scene_name, self.RUN_NAME)
-        if os.path.exists(log_path):
-            raise Exception(f"Run {self.RUN_NAME} already exists")
+        if self.scene_name is not None and self.RUN_NAME is not None:
+            log_path = os.path.join('logs', self.scene_name, self.RUN_NAME)
+            if os.path.exists(log_path):
+                raise Exception(f"Run {self.RUN_NAME} already exists")
 
-        self.writer = SummaryWriter(log_dir=log_path)
-        self.writer.add_hparams({
-            'num_images': self.train_imgs.shape[0],
-            'positional_encoding_reg_percent': self.ray_params.POS_ENC_REG_ITERS_p,
-            'directional_encoding_reg_percent': self.ray_params.DIR_ENC_REG_ITERS_p
-        }, {})
+            self.writer = SummaryWriter(log_dir=log_path)
+            self.writer.add_hparams({
+                'num_images': self.train_imgs.shape[0],
+                'positional_encoding_reg_percent': self.ray_params.POS_ENC_REG_ITERS_p,
+                'directional_encoding_reg_percent': self.ray_params.DIR_ENC_REG_ITERS_p,
+                'use_im_encoder': use_im_encoder,
+                'use_views': use_views,
+                'train_im_encoder': train_im_encoder,
+                'n_views': n_views,
+                'mask_current_view': mask_current_view,
+            }, {})
 
         # placeholder views
         if use_views:
-            c2ws = [self.pose_param_net(i) for i in range(self.train_imgs.shape[0])]
+            c2ws = [self.pose_param_net(i) for i in range(n_views)]
             self.learned_c2ws = torch.stack(c2ws)
             self.learned_c2ws_inv = torch.stack([inv_c2w(c2w) for c2w in c2ws])
-
-    def get_pose_history(self):
-        return torch.stack(self.pose_history).detach().cpu().numpy()  # (N_epoch, N_img, 3)
     
     def _backproject_world_poses(self, sample_pos, fxfy, H, W, current_image=None):
         # rotation + translation
-        R = self.learned_c2ws_inv[:, :3, :3] # (N_cam, 3, 3)
-        t = self.learned_c2ws_inv[:, :3, 3]  # (N_cam, 3)
+        R = self.learned_c2ws_inv[:self.n_views, :3, :3] # (N_cam, 3, 3)
+        t = self.learned_c2ws_inv[:self.n_views, :3, 3]  # (N_cam, 3)
 
         H_rays, W_rays, N_samples, _ = sample_pos.shape
-        N_cam = R.shape[0]
+        N_cam = self.n_views
 
         # expand points for broadcasting
         pts = sample_pos.unsqueeze(0)                    # (1, 32, 32, N_sample, 3)
@@ -101,9 +129,9 @@ class SparseNeRFScene:
             R,
             pts.expand(R.shape[0], -1, -1, -1, -1)
         ) + t[:, None, None, None, :] # (N_cam, W, H, N_sample, 3)
-        pts_cam = pts_cam.detach()
 
         uv, _ = pts_cam_to_img(pts_cam, fxfy[0], fxfy[1], H, W) # (N_cam, 32, 32, N_sample, C)
+        uv = uv.detach()
 
         # pixel coordinates
         u = uv[..., 0]   # (N_cam, 32, 32, N_sample)
@@ -126,9 +154,7 @@ class SparseNeRFScene:
         sampled = sampled.reshape(N_cam, sampled.shape[1], H_rays, W_rays, N_samples)
         sampled = sampled.permute(2, 3, 4, 0, 1)  # (H_rays, W_rays, N_samples, N_cam, C)
 
-        sampled = self.encoded_ims[0,0,0].repeat(H_rays, W_rays, N_samples, N_cam, 1)
-
-        if current_image is not None:
+        if self.mask_current_view and current_image is not None and current_image < N_cam:
             sampled[:, :, :, current_image, :] = 0.0
 
         return sampled.reshape(H_rays, W_rays, N_samples, -1)  # (H_rays, W_rays, N_samples, N_cam * C)
@@ -183,7 +209,7 @@ class SparseNeRFScene:
         if self.train_im_encoder:
             self.im_encoder_net.train()
 
-        t_vals = torch.linspace(self.ray_params.NEAR, self.ray_params.FAR, self.ray_params.N_SAMPLE, device='cuda')  # (N_sample,) sample position
+        t_vals = torch.linspace(self.ray_params.NEAR, self.ray_params.FAR, self.ray_params.N_SAMPLE, device=self.device)  # (N_sample,) sample position
         L2_loss_epoch = []
 
         # shuffle the training imgs
@@ -193,10 +219,10 @@ class SparseNeRFScene:
         for i in ids:
             if self.use_views:
                 if self.use_im_encoder:
-                    inputs = self.train_imgs.permute(0, 3, 1, 2).to('cuda')
+                    inputs = self.train_imgs[:self.n_views].permute(0, 3, 1, 2).to(self.device)
                     self.encoded_ims = self.im_encoder_net(inputs).permute(0, 2, 3, 1)
                 else:
-                    self.encoded_ims = self.train_imgs.to('cuda') # (N, H, W, C)
+                    self.encoded_ims = self.train_imgs[:self.n_views].to(self.device) # (N, H, W, C)
 
                 self.im_features_downsampling_ratio = torch.tensor([
                     self.train_imgs.shape[1]/self.encoded_ims.shape[1],
@@ -207,12 +233,12 @@ class SparseNeRFScene:
 
             # KEY 1: compute ray directions using estimated intrinsics online.
             ray_dir_cam = comp_ray_dir_cam_fxfy(self.H, self.W, fxfy[0], fxfy[1])
-            img = self.train_imgs[i].to('cuda')  # (H, W, 4)
+            img = self.train_imgs[i].to(self.device)  # (H, W, 4)
             c2w = self.pose_param_net(i)  # (4, 4)
 
             # sample 32x32 pixel on an image and their rays for training.
-            r_id = torch.randperm(self.H, device='cuda')[:32]  # (N_select_rows)
-            c_id = torch.randperm(self.W, device='cuda')[:32]  # (N_select_cols)
+            r_id = torch.randperm(self.H, device=self.device)[:32]  # (N_select_rows)
+            c_id = torch.randperm(self.W, device=self.device)[:32]  # (N_select_cols)
             ray_selected_cam = ray_dir_cam[r_id][:, c_id]  # (N_select_rows, N_select_cols, 3)
             img_selected = img[r_id][:, c_id]  # (N_select_rows, N_select_cols, 3)
 
@@ -241,9 +267,9 @@ class SparseNeRFScene:
         self.nerf_model.eval()
 
         ray_dir_cam = comp_ray_dir_cam_fxfy(H, W, fxfy[0], fxfy[1])
-        t_vals = torch.linspace(self.ray_params.NEAR, self.ray_params.FAR, self.ray_params.N_SAMPLE, device='cuda')  # (N_sample,) sample position
+        t_vals = torch.linspace(self.ray_params.NEAR, self.ray_params.FAR, self.ray_params.N_SAMPLE, device=self.device)  # (N_sample,) sample position
 
-        c2w = c2w.to('cuda')  # (4, 4)
+        c2w = c2w.to(self.device)  # (4, 4)
 
         # split an image to rows when the input image resolution is high
         rays_dir_cam_split_rows = ray_dir_cam.split(10, dim=0)  # input 10 rows each time
@@ -265,7 +291,8 @@ class SparseNeRFScene:
     def train_epoch(self):
         L2_loss = self._train_one_epoch_inner()
         train_psnr = mse2psnr(L2_loss)
-        self.writer.add_scalar('train/psnr', train_psnr, self.epoch)
+        if self.writer is not None:
+            self.writer.add_scalar('train/psnr', train_psnr, self.epoch)
         
         fxfy = self.focal_net()
         print('epoch {0:4d} Training PSNR {1:.3f}, estimated fx {2:.1f} fy {3:.1f}'.format(self.epoch, train_psnr, fxfy[0], fxfy[1]))
@@ -273,18 +300,18 @@ class SparseNeRFScene:
         for sc in self.schedulers: sc.step()
 
         if self.use_views:
-            c2ws = [self.pose_param_net(i) for i in range(self.train_imgs.shape[0])]
+            c2ws = [self.pose_param_net(i) for i in range(self.n_views)]
             self.learned_c2ws = torch.stack(c2ws)
             self.learned_c2ws_inv = torch.stack([inv_c2w(c2w) for c2w in c2ws])
-            self.pose_history.append(self.learned_c2ws[:, :3, 3])  # (N, 3) only store positions as we vis in 2D.
 
-        with torch.no_grad():
-            if (self.epoch+1) % self.EVAL_INTERVAL == 0:
-                eval_c2w = torch.eye(4, dtype=torch.float32)  # (4, 4)
-                fxfy = self.focal_net()
-                rendered_img, rendered_depth = self.render_novel_view(self.H, self.W, eval_c2w, fxfy)
-                self.writer.add_image('eval/img', rendered_img.permute(2, 0, 1), global_step=self.epoch)
-                self.writer.add_image('eval/depth', rendered_depth.unsqueeze(0), global_step=self.epoch)
+        if self.writer is not None:
+            with torch.no_grad():
+                if (self.epoch+1) % self.EVAL_INTERVAL == 0:
+                    eval_c2w = torch.eye(4, dtype=torch.float32)  # (4, 4)
+                    fxfy = self.focal_net()
+                    rendered_img, rendered_depth = self.render_novel_view(self.H, self.W, eval_c2w, fxfy)
+                    self.writer.add_image('eval/img', rendered_img.permute(2, 0, 1), global_step=self.epoch)
+                    self.writer.add_image('eval/depth', rendered_depth.unsqueeze(0), global_step=self.epoch)
         
         self.epoch += 1
     
@@ -317,13 +344,14 @@ class SparseNeRFScene:
             novel_img_list = (torch.stack(novel_img_list) * 255).cpu().numpy().astype(np.uint8)
             novel_depth_list = (torch.stack(novel_depth_list) * 200).cpu().numpy().astype(np.uint8)  # depth is always in 0 to 1 in NDC
 
-            os.makedirs(os.path.join('nvs_results', self.RUN_NAME), exist_ok=True)
-            imageio.mimwrite(os.path.join('nvs_results', self.RUN_NAME, self.scene_name + '_img.gif'), novel_img_list, fps=30, loop=0)
-            imageio.mimwrite(os.path.join('nvs_results', self.RUN_NAME, self.scene_name + '_depth.gif'), novel_depth_list, fps=30, loop=0)
-            print('GIF images saved.')
+            if self.scene_name is not None and self.RUN_NAME is not None:
+                os.makedirs(os.path.join('nvs_results', self.RUN_NAME), exist_ok=True)
+                imageio.mimwrite(os.path.join('nvs_results', self.RUN_NAME, self.scene_name + '_img.gif'), novel_img_list, fps=30, loop=0)
+                imageio.mimwrite(os.path.join('nvs_results', self.RUN_NAME, self.scene_name + '_depth.gif'), novel_depth_list, fps=30, loop=0)
+                print('GIF images saved.')
 
 memo = None
-def get_freq_reg_mask(pos_enc_length, current_iter, total_reg_iter):
+def get_freq_reg_mask(pos_enc_length, current_iter, total_reg_iter, device):
     """
     Returns a frequency mask for position encoding
     """
@@ -332,7 +360,7 @@ def get_freq_reg_mask(pos_enc_length, current_iter, total_reg_iter):
         return memo[1].detach().clone()
 
     if current_iter < total_reg_iter:
-        freq_mask = torch.zeros(pos_enc_length, device="cuda")
+        freq_mask = torch.zeros(pos_enc_length, device=device)
 
         ptr = pos_enc_length / 3 * current_iter / total_reg_iter + 1
         ptr = min(ptr, pos_enc_length / 3)
@@ -356,7 +384,7 @@ def get_freq_reg_mask(pos_enc_length, current_iter, total_reg_iter):
         out = freq_mask
 
     else:
-        out = torch.ones(pos_enc_length, device="cuda")
+        out = torch.ones(pos_enc_length, device=device)
 
     memo = ((pos_enc_length, current_iter, total_reg_iter), out)
     return out
@@ -367,7 +395,7 @@ def encode_position_regularized(input, levels, inc_input, current_iter, total_re
     if current_iter is None:
         return raw
     
-    mask = get_freq_reg_mask(raw.shape[-1], current_iter, total_reg_iter)
+    mask = get_freq_reg_mask(raw.shape[-1], current_iter, total_reg_iter, input.device)
     return raw * mask
 
 def pts_cam_to_img(pts_cam, fx, fy, H, W):
