@@ -22,9 +22,11 @@ class SparseNeRFScene:
         self.focal_net = LearnFocal(H, W, req_grad=True).cuda()
         self.pose_param_net = LearnPose(num_cams=train_imgs.shape[0], learn_R=True, learn_t=True).cuda()
 
-        img_features = 3 * train_imgs.shape[0]
-        if use_im_encoder:
-            img_features = im_encoder_out_features * train_imgs.shape[0]
+        img_features = None
+        if use_views:
+            img_features = 3 * train_imgs.shape[0]
+            if use_im_encoder:
+                img_features = im_encoder_out_features * train_imgs.shape[0]
 
         # Get a tiny NeRF model. Hidden dimension set to 128
         self.nerf_model = TinyNerf(pos_in_dims=63, dir_in_dims=27, D=128, image_feat_dim=img_features).cuda()
@@ -189,16 +191,17 @@ class SparseNeRFScene:
         np.random.shuffle(ids)
 
         for i in ids:
-            if self.use_im_encoder:
-                inputs = self.train_imgs.permute(0, 3, 1, 2).to('cuda')
-                self.encoded_ims = self.im_encoder_net(inputs).permute(0, 2, 3, 1)
-            else:
-                self.encoded_ims = self.train_imgs.to('cuda') # (N, H, W, C)
+            if self.use_views:
+                if self.use_im_encoder:
+                    inputs = self.train_imgs.permute(0, 3, 1, 2).to('cuda')
+                    self.encoded_ims = self.im_encoder_net(inputs).permute(0, 2, 3, 1)
+                else:
+                    self.encoded_ims = self.train_imgs.to('cuda') # (N, H, W, C)
 
-            self.im_features_downsampling_ratio = torch.tensor([
-                self.train_imgs.shape[1]/self.encoded_ims.shape[1],
-                self.train_imgs.shape[2]/self.encoded_ims.shape[2]
-            ], device=self.encoded_ims.device)
+                self.im_features_downsampling_ratio = torch.tensor([
+                    self.train_imgs.shape[1]/self.encoded_ims.shape[1],
+                    self.train_imgs.shape[2]/self.encoded_ims.shape[2]
+                ], device=self.encoded_ims.device)
 
             fxfy = self.focal_net()
 
@@ -269,10 +272,11 @@ class SparseNeRFScene:
 
         for sc in self.schedulers: sc.step()
 
-        c2ws = [self.pose_param_net(i) for i in range(self.train_imgs.shape[0])]
-        self.learned_c2ws = torch.stack(c2ws)
-        self.learned_c2ws_inv = torch.stack([inv_c2w(c2w) for c2w in c2ws])
-        self.pose_history.append(self.learned_c2ws[:, :3, 3])  # (N, 3) only store positions as we vis in 2D.
+        if self.use_views:
+            c2ws = [self.pose_param_net(i) for i in range(self.train_imgs.shape[0])]
+            self.learned_c2ws = torch.stack(c2ws)
+            self.learned_c2ws_inv = torch.stack([inv_c2w(c2w) for c2w in c2ws])
+            self.pose_history.append(self.learned_c2ws[:, :3, 3])  # (N, 3) only store positions as we vis in 2D.
 
         with torch.no_grad():
             if (self.epoch+1) % self.EVAL_INTERVAL == 0:
