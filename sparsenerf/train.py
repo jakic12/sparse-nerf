@@ -9,7 +9,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import MultiStepLR
 from tqdm import tqdm
 
-from sparsenerf.networks import LearnFocal, LearnPose, TinyNerf, UNet, inv_c2w
+from sparsenerf.networks import BigNerf, LearnFocal, LearnPose, TinyNerf, UNet, inv_c2w
 from sparsenerf.nerfmm.utils.comp_ray_dir import comp_ray_dir_cam_fxfy
 from sparsenerf.nerfmm.utils.volume_op import volume_rendering, volume_sampling_ndc
 from sparsenerf.nerfmm.utils.pose_utils import create_spiral_poses
@@ -34,6 +34,7 @@ class SparseNeRFScene:
         n_views=-1,
         mask_current_view=True,
         disable_writer=False,
+        use_views_after_N_epochs=1000,
         device='cuda'
     ):
         self.device = device
@@ -50,14 +51,14 @@ class SparseNeRFScene:
         else:
             self.n_views = n_views
 
-        img_features = None
+        self.img_features = None
         if use_views:
-            img_features = 3 * self.n_views
+            self.img_features = 3 * self.n_views
             if use_im_encoder:
-                img_features = im_encoder_out_features * self.n_views
+                self.img_features = im_encoder_out_features * self.n_views
 
         # Get a tiny NeRF model. Hidden dimension set to 128
-        self.nerf_model = TinyNerf(pos_in_dims=63, dir_in_dims=27, D=128, image_feat_dim=img_features).to(self.device)
+        self.nerf_model = TinyNerf(pos_in_dims=63, dir_in_dims=27, D=128, image_feat_dim=self.img_features).to(self.device)
 
         self.im_encoder_net = im_encoder_net
         self.N_EPOCH = N_EPOCH
@@ -68,6 +69,7 @@ class SparseNeRFScene:
         self.RUN_NAME = RUN_NAME
         self.use_im_encoder = use_im_encoder
         self.use_views = use_views
+        self.use_views_after_N_epochs = use_views_after_N_epochs
         self.train_im_encoder = train_im_encoder
         self.mask_current_view = mask_current_view
 
@@ -112,33 +114,40 @@ class SparseNeRFScene:
             self.learned_c2ws = torch.stack(c2ws)
             self.learned_c2ws_inv = torch.stack([inv_c2w(c2w) for c2w in c2ws])
     
-    def _backproject_world_poses(self, sample_pos, fxfy, H, W, current_image=None):
+    def _backproject_world_poses(self, ray_ori_world, ray_dir_world, t_vals_noisy, fxfy, H, W, current_image=None):
         # rotation + translation
         R = self.learned_c2ws_inv[:self.n_views, :3, :3] # (N_cam, 3, 3)
         t = self.learned_c2ws_inv[:self.n_views, :3, 3]  # (N_cam, 3)
 
-        H_rays, W_rays, N_samples, _ = sample_pos.shape
         N_cam = self.n_views
 
+        H_rays, W_rays, _ = ray_ori_world.shape
+        N_samples = t_vals_noisy.shape[-1]
+
+        # (H, W, 1, 3)
+        orig = ray_ori_world[:, :, None, :]
+        dirs = ray_dir_world[:, :, None, :]
+
+        # (H, W, N, 1)
+        t_vals = t_vals_noisy[:, :, :, None]
+
+        # (H, W, N, 3)
+        sample_pos_world = orig + dirs * t_vals
+
         # expand points for broadcasting
-        pts = sample_pos.unsqueeze(0)                    # (1, 32, 32, N_sample, 3)
+        pts = sample_pos_world.unsqueeze(0)  # (1,H,W,N,3)
 
-        # world -> camera
-        pts_cam = torch.einsum(
-            'cij,cwhnj->cwhni',
-            R,
-            pts.expand(R.shape[0], -1, -1, -1, -1)
-        ) + t[:, None, None, None, :] # (N_cam, W, H, N_sample, 3)
+        pts_cam = torch.matmul(
+            R[:, None, None, None, :, :],
+            pts.unsqueeze(-1)
+        ).squeeze(-1) + t[:, None, None, None, :]
 
-        uv, _ = pts_cam_to_img(pts_cam, fxfy[0], fxfy[1], H, W) # (N_cam, 32, 32, N_sample, C)
-        uv = uv.detach()
+        rows, cols, _ = pts_cam_to_img(pts_cam, fxfy[0], fxfy[1], H, W) # (N_cam, 32, 32, N_sample)
+        rows = rows.detach()
+        cols = cols.detach()
 
-        # pixel coordinates
-        u = uv[..., 0]   # (N_cam, 32, 32, N_sample)
-        v = uv[..., 1]   # (N_cam, 32, 32, N_sample)
-
-        grid_y = 2.0 * (u / (H - 1)) - 1.0
-        grid_x = 2.0 * (v / (W - 1)) - 1.0
+        grid_y = 2.0 * (rows / (H - 1)) - 1.0
+        grid_x = 2.0 * (cols / (W - 1)) - 1.0
 
         grid = torch.stack([grid_x, grid_y], dim=-1) # (N_cam, H_rays, W_rays, N_samples, 2)
         grid = grid.reshape(N_cam, H_rays, W_rays * N_samples, 2)
@@ -172,7 +181,7 @@ class SparseNeRFScene:
         """
         # KEY 2: sample the 3D volume using estimated poses and intrinsics online.
         # (H, W, N_sample, 3), (H, W, 3), (H, W, N_sam)
-        sample_pos, _, ray_dir_world, t_vals_noisy = volume_sampling_ndc(c2w, rays_cam, t_vals, self.ray_params.NEAR,
+        sample_pos, ray_ori_world, ray_dir_world, t_vals_noisy = volume_sampling_ndc(c2w, rays_cam, t_vals, self.ray_params.NEAR,
                                                                         self.ray_params.FAR, H, W, fxfy, perturb_t)
 
         # encode position: (H, W, N_sample, (2L+1)*C = 63)
@@ -185,7 +194,17 @@ class SparseNeRFScene:
 
         img_feat = None
         if self.use_views:
-            img_feat = self._backproject_world_poses(sample_pos, fxfy, H, W, image_i)
+            if self.epoch > self.use_views_after_N_epochs:
+                ray_dir_world = (c2w[:3,:3] @ rays_cam.reshape(-1,3).T).T
+                ray_ori_world = c2w[:3,3].expand_as(ray_dir_world)
+
+                ray_dir_world = ray_dir_world.reshape(t_vals_noisy.shape[0], t_vals_noisy.shape[1], -1)
+                ray_ori_world = ray_ori_world.reshape(t_vals_noisy.shape[0], t_vals_noisy.shape[1], -1)
+
+                img_feat = self._backproject_world_poses(ray_ori_world, ray_dir_world, t_vals_noisy, fxfy, H, W, image_i)
+            else:
+                H_rays, W_rays, N_samples, _ = sample_pos.shape
+                img_feat = torch.zeros(H_rays, W_rays, N_samples, self.img_features).to(self.device) # (H_rays, W_rays, N_samples, N_cam * C)
 
         # inference rgb and density using position and direction encoding.
         rgb_density = self.nerf_model(pos_enc, dir_enc, img_feat)  # (H, W, N_sample, 4)
@@ -235,6 +254,10 @@ class SparseNeRFScene:
             ray_dir_cam = comp_ray_dir_cam_fxfy(self.H, self.W, fxfy[0], fxfy[1])
             img = self.train_imgs[i].to(self.device)  # (H, W, 4)
             c2w = self.pose_param_net(i)  # (4, 4)
+
+            if i < self.n_views:
+                self.learned_c2ws[i] = c2w
+                self.learned_c2ws_inv[i] = inv_c2w(c2w)
 
             # sample 32x32 pixel on an image and their rays for training.
             r_id = torch.randperm(self.H, device=self.device)[:32]  # (N_select_rows)
@@ -288,14 +311,14 @@ class SparseNeRFScene:
         rendered_depth = torch.cat(rendered_depth, dim=0)  # (H, W)
         return rendered_img, rendered_depth
 
-    def train_epoch(self):
+    def train_epoch(self):            
         L2_loss = self._train_one_epoch_inner()
         train_psnr = mse2psnr(L2_loss)
         if self.writer is not None:
             self.writer.add_scalar('train/psnr', train_psnr, self.epoch)
         
         fxfy = self.focal_net()
-        print('epoch {0:4d} Training PSNR {1:.3f}, estimated fx {2:.1f} fy {3:.1f}'.format(self.epoch, train_psnr, fxfy[0], fxfy[1]))
+        #print('epoch {0:4d} Training PSNR {1:.3f}, estimated fx {2:.1f} fy {3:.1f}'.format(self.epoch, train_psnr, fxfy[0], fxfy[1]))
 
         for sc in self.schedulers: sc.step()
 
@@ -349,6 +372,36 @@ class SparseNeRFScene:
                 imageio.mimwrite(os.path.join('nvs_results', self.RUN_NAME, self.scene_name + '_img.gif'), novel_img_list, fps=30, loop=0)
                 imageio.mimwrite(os.path.join('nvs_results', self.RUN_NAME, self.scene_name + '_depth.gif'), novel_depth_list, fps=30, loop=0)
                 print('GIF images saved.')
+    
+    def save_encoded_ims(self):
+        save_dir = os.path.join('nvs_results', self.RUN_NAME, 'encoded')
+        os.makedirs(save_dir, exist_ok=True)
+
+        cpu_ims = self.encoded_ims.detach().cpu().numpy()
+        N, _, _, C = cpu_ims.shape
+
+        for i in range(N):          # batch dimension
+            for c in range(C):      # channel dimension
+
+                channel = cpu_ims[i, :, :, c]
+
+                # Normalize this channel independently to 0-255
+                ch_min = channel.min()
+                ch_max = channel.max()
+
+                if ch_max > ch_min:
+                    channel_norm = (channel - ch_min) / (ch_max - ch_min)
+                else:
+                    # constant channel
+                    channel_norm = np.zeros_like(channel)
+
+                channel_uint8 = (channel_norm * 255).astype(np.uint8)
+
+                imageio.imwrite(
+                    os.path.join(save_dir, f'enc_im_{i}_c_{c}.png'),
+                    channel_uint8
+                )
+
 
 memo = None
 def get_freq_reg_mask(pos_enc_length, current_iter, total_reg_iter, device):
@@ -398,7 +451,7 @@ def encode_position_regularized(input, levels, inc_input, current_iter, total_re
     mask = get_freq_reg_mask(raw.shape[-1], current_iter, total_reg_iter, input.device)
     return raw * mask
 
-def pts_cam_to_img(pts_cam, fx, fy, H, W):
+def pts_cam_to_img(pts_cam, fx, fy, H, W, eps = 1e-6):
     """
     Project camera-space points into image pixel coordinates.
 
@@ -423,11 +476,9 @@ def pts_cam_to_img(pts_cam, fx, fy, H, W):
 
     # OpenGL convention:
     # forward = -z
-    depth = -z
+    depth = torch.clamp(-z, min=eps)
 
-    u = -fy * (y / depth) + 0.5 * H
-    v = fx * (x / depth) + 0.5 * W
+    rows = -fy * (y / depth) + 0.5 * H
+    cols = fx * (x / depth) + 0.5 * W
 
-    uv = torch.stack([u, v], dim=-1)
-
-    return uv, depth
+    return rows, cols, depth

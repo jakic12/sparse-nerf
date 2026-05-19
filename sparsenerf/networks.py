@@ -148,6 +148,90 @@ class TinyNerf(nn.Module):
         rgb_den = torch.cat([rgb, density], dim=3)  # (H, W, N_sample, 4)
         return rgb_den
 
+class BigNerf(nn.Module):
+    def __init__(self, pos_in_dims, dir_in_dims, D, image_feat_dim=None):
+        """
+        :param pos_in_dims:   scalar, number of channels of encoded positions
+        :param dir_in_dims:   scalar, number of channels of encoded directions
+        :param D:             scalar, number of hidden dimensions
+        :param image_feat_dim: scalar or None, number of image feature channels
+        """
+        super(BigNerf, self).__init__()
+
+        self.pos_in_dims = pos_in_dims
+        self.dir_in_dims = dir_in_dims
+        self.image_feat_dim = image_feat_dim
+
+        # Input dimension includes optional image features
+        input_dims = pos_in_dims + (image_feat_dim or 0)
+
+        self.layers0 = nn.Sequential(
+            nn.Linear(input_dims, D), nn.ReLU(),
+            nn.Linear(D, D), nn.ReLU(),
+            nn.Linear(D, D), nn.ReLU(),
+            nn.Linear(D, D), nn.ReLU(),
+        )
+
+        self.layers1 = nn.Sequential(
+            nn.Linear(D + input_dims, D), nn.ReLU(),  # shortcut
+            nn.Linear(D, D), nn.ReLU(),
+            nn.Linear(D, D), nn.ReLU(),
+            nn.Linear(D, D), nn.ReLU(),
+        )
+
+        self.fc_density = nn.Linear(D, 1)
+        self.fc_feature = nn.Linear(D, D)
+
+        self.rgb_layers = nn.Sequential(
+            nn.Linear(D + dir_in_dims, D // 2),
+            nn.ReLU()
+        )
+
+        self.fc_rgb = nn.Linear(D // 2, 3)
+
+        self.fc_density.bias.data = torch.tensor([0.1]).float()
+        self.fc_rgb.bias.data = torch.tensor([0.02, 0.02, 0.02]).float()
+
+    def forward(self, pos_enc, dir_enc, image_feat=None):
+        """
+        :param pos_enc:   (H, W, N_sample, pos_in_dims)
+        :param dir_enc:   (H, W, N_sample, dir_in_dims)
+        :param image_feat:(H, W, N_sample, image_feat_dim) or None
+        :return: rgb_density (H, W, N_sample, 4)
+        """
+
+        if image_feat is not None and self.image_feat_dim is None:
+            raise Exception("Please set image_feat_dim to use image features")
+
+        # Concatenate optional image features
+        if image_feat is not None:
+            x_in = torch.cat([pos_enc, image_feat], dim=3)
+        else:
+            x_in = pos_enc
+
+        # First MLP block
+        x = self.layers0(x_in)
+
+        # Skip connection with original input
+        x = torch.cat([x, x_in], dim=3)
+
+        # Second MLP block
+        x = self.layers1(x)
+
+        # Density branch
+        density = self.fc_density(x)
+
+        # Color branch
+        feat = self.fc_feature(x)
+        x = torch.cat([feat, dir_enc], dim=3)
+
+        x = self.rgb_layers(x)
+        rgb = self.fc_rgb(x)
+
+        rgb_den = torch.cat([rgb, density], dim=3)
+
+        return rgb_den
+
 def initialize_weights(m):
     if isinstance(m, nn.Conv2d):
         nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
